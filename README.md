@@ -106,6 +106,51 @@ asserts the harness notices:
 `selfcheck` is the part that makes the rest trustworthy: a test harness nobody
 tests is a liability.
 
+## Worked examples: where a System One model is the right tool
+
+```bash
+systemone-probe examples                    # the catalogue: decision, why, what your code does
+systemone-probe examples --check            # validate every payload locally, no network, no cost
+systemone-probe examples --show rag_gate    # the exact HTTP request, ready to paste
+systemone-probe examples --run --api-key-env TYPESAFE_API_KEY --out examples/results
+```
+
+`examples/catalog.json` holds twelve complete requests. Six are the vendor's own
+high-volume patterns (chat moderation, passage re-ranking, confidence-gated
+classification, citation checking, RAG gating, agent tool routing); six are
+problems from this machine's own projects (catalogue-record matching, metadata
+triage, character-trainer grading).
+
+Each entry carries three fields that decide whether it is a System One problem at
+all:
+
+- `why` — the property of the decision that makes a typed, calibrated answer
+  better than generated text.
+- `code_then` — what your code does with the numbers. If you cannot write this
+  line, the decision is not a System One decision.
+- `documented` — the vendor's published measurement for that pattern, so an
+  example can be judged against a real number instead of an opinion.
+
+### The test in one sentence
+
+**A decision belongs on a System One model when a closed, enumerable answer set is
+consumed by code, the same judgement is repeated many times, and you need a
+probability to decide whether to act on it.** Everything else — generation,
+multi-step reasoning, open-ended analysis, writing prose — stays with an LLM, or
+with your own deterministic code.
+
+Corollaries worth internalising:
+
+* **Atomic questions, weighted in code.** "Rate this startup pitch" is not a
+  question; market size, technical feasibility and differentiation are. Combine
+  them yourself so priorities live in a coefficient, not a prompt.
+* **Confidence is a second axis.** The answer tells you *what*, confidence tells
+  you *whether to act*. Low confidence is a routing decision to a human, not a
+  failure.
+* **The model is not the perception layer and not the actor.** Render the state,
+  ask the narrow question, keep the veto — the vendor's own drone example runs
+  classical CV for the scene and Jev only for the ~2.5 Hz tactical call.
+
 ## What this harness deliberately does not do
 
 * **No LLM-judge grading.** Nothing here evaluates text, because a System One
@@ -143,11 +188,14 @@ off-machine. Use `--suite contract,determinism` for a cheap smoke test, or the
 ```
 src/systemone_probe/
   client.py       # POST /v1/systemone, timing, retries, usage
-  conformance.py  # contract checks + the documented confidence formulas
+  conformance.py  # contract checks, request validation, the documented formulas
   datasets.py     # mechanically-labelled probe items
   suites.py       # the seven suites
   mock.py         # offline reference endpoint + fault injection
+  examples.py     # the worked-example catalogue (load, render, run)
   report.py       # markdown / JSON reports
-  cli.py          # run | mock | selfcheck
-tests/            # formulas, detection, dataset truth, end-to-end over real HTTP
+  cli.py          # run | mock | selfcheck | examples
+examples/
+  catalog.json    # twelve requests: state, questions, why, code_then, documented result
+tests/            # formulas, detection, dataset truth, request validation, end-to-end
 ```

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
+from systemone_probe import examples as examples_mod
 from systemone_probe import report as report_mod
 from systemone_probe.client import DEFAULT_BASE_URL, SystemOneClient
 from systemone_probe.datasets import build_dataset
@@ -99,6 +102,115 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_mock(args: argparse.Namespace) -> int:
     serve_forever(mode=args.mode, host=args.host, port=args.port)
     return 0
+
+
+# ------------------------------------------------------------------- examples
+
+
+def cmd_examples(args: argparse.Namespace) -> int:
+    """Show, check, or run the worked examples of where a System One model fits."""
+    if args.show:
+        worst = 0
+        for example_id in [s.strip() for s in args.show.split(",") if s.strip()]:
+            try:
+                example = examples_mod.get_example(example_id)
+            except KeyError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            print(f"# {example.id} — {example.title}")
+            print(f"domain: {example.domain}")
+            print(f"why:    {example.why}")
+            print(f"then:   {example.code_then}")
+            if example.documented:
+                print(f"measured: {example.documented.get('result')}")
+                print(f"source:   {example.documented.get('source')}")
+            print()
+            print(examples_mod.to_curl(example, args.base_url, model=args.model))
+            print()
+        return worst
+
+    if args.check:
+        problems = 0
+        for example in examples_mod.load_catalog():
+            violations = example.validate()
+            if violations:
+                problems += len(violations)
+                print(f"[FAIL] {example.id}")
+                for v in violations:
+                    print(f"        {v.code}: {v.detail}")
+            else:
+                n = len(example.questions)
+                print(f"[ok]   {example.id}  ({n} question{'s' if n != 1 else ''}: "
+                      f"{', '.join(example.question_types)})")
+        print()
+        print("payloads valid" if not problems else f"{problems} payload problem(s)")
+        return 0 if not problems else 1
+
+    if args.run:
+        catalog = examples_mod.load_catalog()
+        wanted = [s.strip() for s in args.only.split(",") if s.strip()] if args.only else [e.id for e in catalog]
+        client = _build_client(args)
+        if any(tok in client.base_url for tok in ("127.0.0.1", "localhost", "0.0.0.0")):
+            print(
+                "note: this target is local. The bundled stub only understands the probe dataset, "
+                "so its answers to these examples are stub output, not model output.\n",
+                file=sys.stderr,
+            )
+        results: list[dict[str, Any]] = []
+        for example in catalog:
+            if example.id not in wanted:
+                continue
+            result = examples_mod.run_example(example, client, model=args.model)
+            results.append(result)
+            print(examples_mod.render_result(result))
+            print()
+        if not results:
+            print("no examples selected", file=sys.stderr)
+            return 2
+        if args.out:
+            out_dir = Path(args.out)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "results.json").write_text(
+                json.dumps(
+                    {"target": client.base_url, "model": args.model or "per-example",
+                     "results": results},
+                    indent=2, sort_keys=True, default=str,
+                )
+            )
+            (out_dir / "results.md").write_text(_examples_markdown(results, client.base_url))
+            print(f"wrote {out_dir/'results.md'} and {out_dir/'results.json'}")
+        return 0 if all(r["ok"] for r in results) else 1
+
+    print(examples_mod.render_catalog(examples_mod.load_catalog()))
+    print("show one:  systemone-probe examples --show support_triage")
+    print("validate:  systemone-probe examples --check")
+    print("run live:  systemone-probe examples --run --base-url ... --api-key-env TYPESAFE_API_KEY")
+    return 0
+
+
+def _examples_markdown(results: list[dict[str, Any]], target: str) -> str:
+    lines = ["# Worked examples — request and result", "", f"- endpoint: `{target}/v1/systemone`", ""]
+    for r in results:
+        lines.append(f"## {r['example']} — {r['title']}")
+        lines.append("")
+        lines.append(f"- domain: {r['domain']}")
+        lines.append(f"- status: {r['status']} in {r['latency_ms']} ms, answered by `{r['response_model']}`")
+        lines.append("")
+        if not r["ok"]:
+            lines.append(f"```text\nFAILED: {r.get('error')}\n```")
+            lines.append("")
+            continue
+        lines.append("```json")
+        lines.append(json.dumps(r["answers"], indent=2, ensure_ascii=False))
+        lines.append("```")
+        lines.append("")
+        lines.append(f"Then in code: {r['code_then']}")
+        if r.get("documented"):
+            doc = r["documented"]
+            lines.append("")
+            lines.append(f"Vendor-measured on this pattern: {doc.get('result')} ({doc.get('source')})")
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ selfcheck
@@ -199,6 +311,24 @@ def build_parser() -> argparse.ArgumentParser:
     mock.add_argument("--host", default="127.0.0.1")
     mock.add_argument("--port", type=int, default=8111)
     mock.set_defaults(func=cmd_mock)
+
+    ex = sub.add_parser(
+        "examples",
+        help="where a System One model fits: request bodies, reasons, and results",
+    )
+    ex.add_argument("--show", default=None, help="print the request for one example id (comma-separated)")
+    ex.add_argument("--check", action="store_true", help="validate every example payload locally, no network")
+    ex.add_argument("--run", action="store_true", help="send the examples to --base-url and save the results")
+    ex.add_argument("--only", default=None, help="comma-separated example ids for --run")
+    ex.add_argument("--base-url", default=os.environ.get("SYSTEMONE_BASE_URL", DEFAULT_BASE_URL))
+    ex.add_argument("--model", default=None, help="override the model (default: per-example, usually jev-latest)")
+    ex.add_argument("--api-key", default=None, help="API key (prefer --api-key-env)")
+    ex.add_argument("--api-key-env", default="TYPESAFE_API_KEY", help="env var holding the key")
+    ex.add_argument("--out", default="examples/results", help="directory for results.md/results.json")
+    ex.add_argument("--no-out", action="store_const", const="", dest="out")
+    ex.add_argument("--timeout", type=float, default=60.0)
+    ex.add_argument("--retries", type=int, default=2)
+    ex.set_defaults(func=cmd_examples)
 
     self_check = sub.add_parser("selfcheck", help="verify the harness detects each injected fault")
     self_check.add_argument("--seed", type=int, default=20261016)

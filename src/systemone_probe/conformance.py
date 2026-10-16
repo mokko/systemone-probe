@@ -287,3 +287,102 @@ def is_finite_number(v: Any) -> bool:
         and isinstance(v, (int, float))
         and math.isfinite(float(v))
     )
+
+
+# ------------------------------------------------------------- request checking
+# Catching payload bugs before the request costs money. These mirror the
+# documented request rules; they are not a substitute for the server's 400/422.
+
+MAX_NESTING = 64
+MAX_CHOICE_OPTIONS = 255
+MAX_SCORE_LEVELS = 10
+
+
+def _depth(node: Any, limit: int = MAX_NESTING) -> int:
+    """Deepest object/array nesting, cheaply capped."""
+    if isinstance(node, dict):
+        return 1 + max((_depth(v, limit - 1) for v in node.values()), default=0)
+    if isinstance(node, list):
+        return 1 + max((_depth(v, limit - 1) for v in node), default=0)
+    return 0
+
+
+def _nonfinite_paths(node: Any, prefix: str = "state") -> list[str]:
+    out: list[str] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            out += _nonfinite_paths(v, f"{prefix}.{k}")
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out += _nonfinite_paths(v, f"{prefix}[{i}]")
+    elif isinstance(node, float) and not math.isfinite(node):
+        out.append(prefix)
+    return out
+
+
+def check_question(qid: str, question: Any) -> list[Violation]:
+    """Validate one question against the documented shape, before sending it."""
+    out: list[Violation] = []
+    if not isinstance(question, dict):
+        return [Violation("question.not_object", f"{qid}: question is {type(question).__name__}")]
+    qtype = question.get("type")
+    if qtype not in QUESTION_TYPES:
+        out.append(Violation("question.type_unknown", f"{qid}: type {qtype!r} not in {sorted(QUESTION_TYPES)}"))
+    instr = question.get("instructions")
+    if instr is None:
+        out.append(Violation("question.instructions", f"{qid}: instructions is required"))
+    elif not isinstance(instr, (str, dict, list)):
+        out.append(Violation("question.instructions", f"{qid}: instructions must be string/object/array"))
+    elif _depth(instr) > MAX_NESTING:
+        out.append(Violation("question.nesting", f"{qid}: instructions nest deeper than {MAX_NESTING}"))
+
+    criteria = question.get("criteria")
+    if qtype == "choice":
+        if not isinstance(criteria, dict) or not criteria:
+            out.append(Violation("question.criteria", f"{qid}: choice needs a non-empty criteria map"))
+        elif len(criteria) > MAX_CHOICE_OPTIONS:
+            out.append(Violation("question.criteria", f"{qid}: {len(criteria)} options > {MAX_CHOICE_OPTIONS}"))
+    elif qtype == "score":
+        if not isinstance(criteria, list):
+            out.append(Violation("question.criteria", f"{qid}: score needs a criteria array of levels"))
+        elif not 2 <= len(criteria) <= MAX_SCORE_LEVELS:
+            out.append(
+                Violation(
+                    "question.criteria",
+                    f"{qid}: {len(criteria)} levels; docs allow 2..{MAX_SCORE_LEVELS}",
+                )
+            )
+    elif qtype == "noul" and criteria is not None:
+        if not isinstance(criteria, dict) or not set(criteria) <= {"true", "false"}:
+            out.append(
+                Violation("question.criteria", f"{qid}: noul criteria keys must be 'true' and/or 'false'")
+            )
+    elif qtype == "box" and criteria is not None:
+        out.append(Violation("question.criteria", f"{qid}: box takes no criteria"))
+    return out
+
+
+def check_request(payload: dict[str, Any]) -> list[Violation]:
+    """Validate a whole request body before it leaves the machine."""
+    out: list[Violation] = []
+    if not isinstance(payload, dict):
+        return [Violation("request.not_object", "payload is not an object")]
+    state = payload.get("state")
+    if state is None:
+        out.append(Violation("request.state", "state is required"))
+    elif not isinstance(state, (str, dict, list)):
+        out.append(Violation("request.state", f"state is {type(state).__name__}, expected string/object/array"))
+    elif isinstance(state, (dict, list)):
+        if _depth(state) > MAX_NESTING:
+            out.append(Violation("request.nesting", f"state nests deeper than {MAX_NESTING}"))
+        for path in _nonfinite_paths(state):
+            out.append(Violation("request.non_finite", f"{path} is not a finite number"))
+    if not isinstance(payload.get("model"), str) or not payload.get("model"):
+        out.append(Violation("request.model", "model is required"))
+    questions = payload.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        out.append(Violation("request.questions", "questions must be a non-empty map"))
+    else:
+        for qid, q in questions.items():
+            out += check_question(qid, q)
+    return out

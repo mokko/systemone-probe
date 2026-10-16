@@ -332,3 +332,109 @@ def test_selfcheck_command_passes():
     from systemone_probe.cli import main
 
     assert main(["selfcheck"]) == 0
+
+
+# ------------------------------------------------------------------ examples
+
+
+def test_catalog_loads_and_is_consistent():
+    from systemone_probe.examples import load_catalog
+
+    catalog = load_catalog()
+    assert len(catalog) >= 10
+    ids = [e.id for e in catalog]
+    assert len(ids) == len(set(ids))
+    for example in catalog:
+        assert example.why and example.code_then, f"{example.id} needs why and code_then"
+        assert example.questions, f"{example.id} has no questions"
+
+
+def test_every_example_payload_is_valid():
+    from systemone_probe.examples import load_catalog
+
+    for example in load_catalog():
+        assert example.validate() == [], f"{example.id}: {example.validate()}"
+
+
+def test_request_validation_catches_planted_bugs():
+    from systemone_probe.conformance import check_request
+
+    good = {
+        "state": {"n": 1},
+        "model": "jev-latest",
+        "questions": {"q": {"type": "noul", "instructions": "Is `n` one?"}},
+    }
+    assert check_request(good) == []
+
+    missing_state = {"model": "jev-latest", "questions": good["questions"]}
+    assert {v.code for v in check_request(missing_state)} == {"request.state"}
+
+    non_finite = {"state": {"n": float("inf")}, "model": "m", "questions": good["questions"]}
+    assert "request.non_finite" in {v.code for v in check_request(non_finite)}
+
+    bad_choice = {"state": {}, "model": "m",
+                  "questions": {"q": {"type": "choice", "instructions": "x"}}}
+    assert "question.criteria" in {v.code for v in check_request(bad_choice)}
+
+    too_many_levels = {
+        "state": {},
+        "model": "m",
+        "questions": {"q": {"type": "score", "instructions": "x", "criteria": [str(i) for i in range(11)]}},
+    }
+    assert "question.criteria" in {v.code for v in check_request(too_many_levels)}
+
+    one_level = {"state": {}, "model": "m",
+                 "questions": {"q": {"type": "score", "instructions": "x", "criteria": ["only"]}}}
+    assert "question.criteria" in {v.code for v in check_request(one_level)}
+
+    bad_noul_criteria = {
+        "state": {},
+        "model": "m",
+        "questions": {"q": {"type": "noul", "instructions": "x", "criteria": {"yes": "y"}}},
+    }
+    assert "question.criteria" in {v.code for v in check_request(bad_noul_criteria)}
+
+
+def test_deep_nesting_is_rejected():
+    from systemone_probe.conformance import check_request
+
+    deep: dict[str, object] = {}
+    node = deep
+    for _ in range(70):
+        node["n"] = {}
+        node = node["n"]  # type: ignore[assignment]
+    payload = {"state": deep, "model": "m",
+               "questions": {"q": {"type": "noul", "instructions": "x"}}}
+    assert "request.nesting" in {v.code for v in check_request(payload)}
+
+
+def test_to_curl_targets_the_endpoint():
+    from systemone_probe.examples import get_example, to_curl
+
+    curl = to_curl(get_example("support_triage"), "https://api.typesafe.ai")
+    assert "https://api.typesafe.ai/v1/systemone" in curl
+    assert "TYPESAFE_API_KEY" in curl
+    assert '"is_urgent"' in curl
+
+
+def test_run_example_against_the_stub_returns_one_answer_per_question():
+    from systemone_probe.examples import get_example, render_result, run_example
+
+    example = get_example("support_triage")
+    with MockServer(mode="good") as server:
+        client = SystemOneClient(base_url=server.base_url, api_key="test-key")
+        result = run_example(example, client)
+    assert result["ok"], result
+    assert set(result["answers"]) == set(example.questions)
+    assert "support_triage" in render_result(result)
+    assert render_result(result).count("choice=") == 1
+
+
+def test_examples_cli_check_and_list():
+    from systemone_probe.cli import main
+
+    assert main(["examples", "--check"]) == 0
+    assert main(["examples"]) == 0
+    assert main(["examples", "--show", "museum_record_match"]) == 0
+    assert main(["examples", "--show", "does_not_exist"]) == 2
+
